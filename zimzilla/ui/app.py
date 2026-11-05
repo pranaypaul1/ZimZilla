@@ -30,6 +30,7 @@ from textual.widgets import Input, Static
 
 from .. import ad as ad_mod
 from .. import aihubmix as ah_mod
+from .. import skills as skills_mod
 from .. import beatapi as bp_mod
 from .. import crack as crack_mod
 from .. import antseed as as_mod
@@ -874,6 +875,11 @@ HELP_GROUPS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ("/limits", "context window, round caps, timeouts, and their source"),
         ("/compact", "summarise history to free context"),
         ("/cost", "session token and cost breakdown"),
+    ]),
+    ("skills", "SKILLS", "the operator's playbook library, loadable on demand", [
+        ("/skills [filter]", "list every skill (name + one-liner); filter matches name/description"),
+        ("/skill <name>", "print one skill's full instructions"),
+        ("/skill-search <regex>", "search every skill body for a technique"),
     ]),
     ("upstreams", "UPSTREAMS", "where the tokens come from", [
         ("/zim-source", "show upstream sources and their status"),
@@ -2473,6 +2479,10 @@ class ZimZillaApp(App):
         # harness state, starts no turn, and is most wanted while a turn is
         # running — which is exactly when the reasoning is on screen.
         "think",
+        # Reading the skill library is a local directory walk that starts no
+        # turn — /skills, /skill and /skill-search are most useful while
+        # deciding what to do next, including mid-run.
+        "skills", "skill", "skill-search",
         # `/zim-opencode` hands the terminal to a *different* program and starts
         # no turn on `self.agent`, so it cannot interleave a second turn into a
         # running one. It is also the case where being able to escape a long
@@ -2512,6 +2522,9 @@ class ZimZillaApp(App):
             "load": self._cmd_load,
             "compact": lambda a: self._cmd_compact(),
             "limits": lambda a: self._cmd_limits(),
+            "skills": lambda a: self._cmd_skills(a),
+            "skill": lambda a: self._cmd_skill(a),
+            "skill-search": lambda a: self._cmd_skill_search(a),
             "team": lambda a: self._cmd_team(a),
             "osint": lambda a: self._cmd_osint(a),
             "osint-tree": lambda a: self._cmd_osint_tree(a),
@@ -3422,6 +3435,151 @@ class ZimZillaApp(App):
             "  (python3 -c, $(), encoded hosts) are not detected.\n",
             style=p.dim,
         )
+        self.query_one(ChatPane).write_block(t)
+
+    # ------------------------------------------------------------------ skills
+
+    def _cmd_skills(self, args=None) -> None:
+        """Browse the library: an interactive picker, or a filtered listing."""
+        p = self.palette
+        query = " ".join(args).strip() if args else ""
+        if not query and not self.busy:
+            self._open_skill_picker()
+            return
+        items = skills_mod._index(query or None)
+        roots = [str(r) for r in skills_mod.roots()]
+        t = Text()
+        t.append("  SKILLS  ", style=f"bold {p.accent}")
+        t.append(f"{len(items)}" + (f" matching “{query}”" if query else "") + "\n",
+                 style=p.primary)
+        t.append(f"  roots: {', '.join(roots) or '(none configured)'}\n\n", style=p.dim)
+        if not items:
+            t.append("  nothing matched — try a shorter filter\n", style=p.amber)
+            self.query_one(ChatPane).write_block(t)
+            return
+
+        # group by top-level folder so 189 rows stay readable
+        buckets: dict[str, list] = {}
+        for item in items:
+            try:
+                rel = Path(item["path"]).relative_to(Path(item["root"]))
+                group = rel.parts[0] if len(rel.parts) > 1 else "(top level)"
+            except (ValueError, KeyError):
+                group = "(other)"
+            buckets.setdefault(group, []).append(item)
+
+        for group in sorted(buckets):
+            entries = buckets[group]
+            t.append(f"  {group}  ", style=f"bold {p.accent}")
+            t.append(f"{len(entries)}\n", style=p.dim)
+            for item in entries:
+                t.append(f"    {item['name']:<42}", style=p.primary)
+                desc = item["description"]
+                t.append(" " + (desc if len(desc) <= 110 else desc[:107] + "…") + "\n",
+                         style=p.dim)
+            t.append("\n")
+        t.append("  /skill <name> to load one · /skill-search <regex> to search bodies\n",
+                 style=p.dim)
+        self.query_one(ChatPane).write_block(t)
+
+    def _cmd_skill(self, args=None) -> None:
+        """Load one skill by name."""
+        name = (args[0] if args else "").strip()
+        if not name:
+            self._sys_line("usage: /skill <name>   (/skills opens the picker)", warn=True)
+            return
+        self._load_skill(name)
+
+    def _open_skill_picker(self) -> None:
+        """Type-to-filter picker over the library; Enter loads the chosen skill."""
+        items = skills_mod.discover()
+        if not items:
+            self._sys_line("no skills found — check ~/.hermes/skills", warn=True)
+            return
+        entries = [
+            PaletteEntry(
+                key=item["name"],
+                title=item["name"],
+                hint=item["description"],
+                group="skills",
+                run=(lambda n=item["name"]: self._load_skill(n)),
+            )
+            for item in items
+        ]
+        self.push_screen(CommandPalette(entries, self.palette), self._skill_picked)
+
+    def _skill_picked(self, entry=None) -> None:
+        if entry is not None and entry.run is not None:
+            entry.run()
+
+    def _load_skill(self, name: str) -> None:
+        """Show a skill and, when idle, hand it to the model as context."""
+        p = self.palette
+        match = next((i for i in skills_mod.discover() if i["name"] == name), None)
+        if match is None:
+            close = [i["name"] for i in skills_mod.discover() if name.lower() in i["name"].lower()][:6]
+            hint = f" — did you mean: {', '.join(close)}" if close else ""
+            self._sys_line(f"no skill named '{name}'{hint}", warn=True)
+            return
+        try:
+            text = Path(match["path"]).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            self._sys_line(f"cannot read {match['path']}: {exc}", warn=True)
+            return
+        body = skills_mod._body(text)
+        t = Text()
+        t.append(f"  SKILL  {match['name']}\n", style=f"bold {p.accent}")
+        t.append(f"  {match['path']}\n\n", style=p.dim)
+        t.append(body.rstrip() + "\n", style=p.primary)
+        self.query_one(ChatPane).write_block(t)
+
+        if self.busy:
+            self._sys_line("shown only — a turn is running, so it is not in context yet",
+                           warn=True)
+            return
+        inject = body if len(body) <= 12000 else body[:12000] + "\n… [truncated]"
+        self.agent.messages.append({
+            "role": "user",
+            "content": (f"[skill loaded by the operator: {match['name']}]\n"
+                        f"{inject}\n\n"
+                        f"Treat this as the operator's own playbook for the current task."),
+        })
+        self._sys_line(f"{match['name']} loaded into context — say what to apply it to", ok=True)
+
+    def _cmd_skill_search(self, args=None) -> None:
+        """Regex search across every skill body."""
+        p = self.palette
+        pattern = " ".join(args).strip() if args else ""
+        if not pattern:
+            self._sys_line("usage: /skill-search <regex>", warn=True)
+            return
+        import re as _re
+        try:
+            rx = _re.compile(pattern, _re.IGNORECASE)
+        except _re.error:
+            rx = _re.compile(_re.escape(pattern), _re.IGNORECASE)
+        hits: list[tuple[str, int, str]] = []
+        files = 0
+        for item in skills_mod.discover():
+            try:
+                text = Path(item["path"]).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            matched = False
+            for n, line in enumerate(text.splitlines(), 1):
+                if rx.search(line):
+                    matched = True
+                    if len(hits) < 80:
+                        hits.append((item["name"], n, line.strip()[:150]))
+            files += 1 if matched else 0
+        t = Text()
+        t.append("  SKILL SEARCH  ", style=f"bold {p.accent}")
+        t.append(f"/{pattern}/ → {len(hits)} hits in {files} skills\n\n", style=p.primary)
+        if not hits:
+            t.append("  nothing matched\n", style=p.amber)
+        for name, line, snippet in hits:
+            t.append(f"  {name}:{line}\n", style=p.accent)
+            t.append(f"    {snippet}\n", style=p.dim)
         self.query_one(ChatPane).write_block(t)
 
     def _set_rain(self, active: bool) -> None:
@@ -9388,6 +9546,7 @@ class ZimZillaApp(App):
             ("/mode", "switch mode", "mode"),
             ("/model", "show or switch the model", "model"),
             ("/cost", "session token and cost breakdown", "cost"),
+            ("/skills", "browse and load the skill library", "skills"),
             ("/scope", "scope guard status", "scope"),
             ("/rain", "toggle the matrix rain", "rain"),
             ("/think", "show the model's reasoning", "think"),

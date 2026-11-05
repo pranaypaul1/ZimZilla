@@ -507,6 +507,23 @@ PEER_SCHEMAS: list[dict] = [
 
 TOOL_NAMES = [t["name"] for t in TOOL_SCHEMAS]
 
+# --- extensions: Chrome bridge + skill library -----------------------------
+# Kept in their own modules and merged here so an upstream update to tools.py
+# does not collide with them; both are optional at import time.
+try:
+    from . import bridge as _bridge_mod
+    TOOL_SCHEMAS.extend(_bridge_mod.SCHEMAS)
+except Exception:  # pragma: no cover - never let an extension break the harness
+    _bridge_mod = None
+
+try:
+    from . import skills as _skills_mod
+    TOOL_SCHEMAS.extend(_skills_mod.SCHEMAS)
+except Exception:  # pragma: no cover
+    _skills_mod = None
+
+TOOL_NAMES = [t["name"] for t in TOOL_SCHEMAS]
+
 # Tools that require an explicit user confirmation.
 GATED_TOOLS = {"bash", "write_file", "edit_file"}
 
@@ -1646,6 +1663,11 @@ _DISPATCH = {
     "ldxhub_refine": _tool_ldxhub_refine,
     "ldxhub_list": _tool_ldxhub_list,
 }
+
+if _bridge_mod is not None:
+    _DISPATCH.update(_bridge_mod.DISPATCH)
+if _skills_mod is not None:
+    _DISPATCH.update(_skills_mod.DISPATCH)
 
 
 def summarise_call(name: str, args: dict, cfg, max_len: int = 70) -> str:
